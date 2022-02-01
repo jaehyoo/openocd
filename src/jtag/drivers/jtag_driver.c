@@ -41,7 +41,7 @@ int jtag_hw_accel = 1;
 int jtag_fd;
 
 /* Local Function Prototypes */
-static enum jtag_endstate state_conversion(tap_state_t state);
+static enum jtag_tapstate state_conversion(tap_state_t state);
 static int move_to_state(tap_state_t goal_state);
 static int jtag_driver_get_speed(int *speed);
 static int jtag_driver_set_speed(int speed);
@@ -57,9 +57,9 @@ static int jtag_driver_execute_queue(void);
 static int jtag_driver_init(void);
 static int jtag_driver_quit(void);
 
-static enum jtag_endstate state_conversion(tap_state_t state)
+static enum jtag_tapstate state_conversion(tap_state_t state)
 {
-	enum jtag_endstate endstate;
+	enum jtag_tapstate endstate;
 
 	switch (state) {
 		case TAP_DREXIT2:
@@ -128,10 +128,11 @@ static enum jtag_endstate state_conversion(tap_state_t state)
  */
 static int move_to_state(tap_state_t goal_state)
 {
-	struct jtag_end_tap_state end_state;
+	struct jtag_tap_state end_state;
 	int ret = ERROR_OK;
 	int ret_errno;
 
+	end_state.from = JTAG_STATE_CURRENT;
 	end_state.reset = JTAG_NO_RESET;
 	end_state.endstate = state_conversion(goal_state);
 	end_state.tck = 0;
@@ -225,6 +226,7 @@ static int jtag_driver_execute_scan(struct scan_command *scan)
 	int num_bits;
 	int ret = ERROR_OK;
 	int ret_errno;
+	union pad_config padding;
 
 	type = jtag_scan_type(scan);
 
@@ -248,9 +250,14 @@ static int jtag_driver_execute_scan(struct scan_command *scan)
 		xfer.direction = JTAG_READ_WRITE_XFER;
 	}
 
+	padding.pre_pad_number = 0;
+	padding.post_pad_number = 0;
+
 	xfer.length = (__u32)num_bits;
 	xfer.tdio = (__u64)(uintptr_t)data_buf;
+	xfer.from = JTAG_STATE_CURRENT;
 	xfer.endstate = state_conversion(scan->end_state);
+	xfer.padding = padding.int_value;
 
 	ret_errno = ioctl(jtag_fd, JTAG_IOCXFER, &xfer);
 	if (ret_errno < 0) {
@@ -274,6 +281,7 @@ static int jtag_driver_execute_scan(struct scan_command *scan)
 
 static int jtag_driver_execute_runtest(int num_cycles, tap_state_t state)
 {
+	struct bitbang_packet bitbang_packet;
 	struct tck_bitbang bitbang;
 	int i;
 	int ret = ERROR_OK;
@@ -289,8 +297,11 @@ static int jtag_driver_execute_runtest(int num_cycles, tap_state_t state)
 	bitbang.tdi = (__u8)0; /* write: host to device */
 	bitbang.tdo = (__u8)0; /* read: device to host */
 
+	bitbang_packet.data = &bitbang;
+	bitbang_packet.length = 1;
+
 	for (i = 0; i < num_cycles && ret == ERROR_OK; i++) {
-		ret_errno = ioctl(jtag_fd, JTAG_IOCBITBANG, &bitbang);
+		ret_errno = ioctl(jtag_fd, JTAG_IOCBITBANG, &bitbang_packet);
 		if (ret_errno < 0) {
 			LOG_ERROR("JTAG DRIVER ERROR: couldn't execute runtest");
 			ret = ERROR_FAIL;
@@ -325,7 +336,7 @@ static int jtag_driver_execute_stableclocks(struct stableclocks_command *stablec
 
 static int jtag_driver_reset(int trst, int srst)
 {
-	struct jtag_end_tap_state end_state;
+	struct jtag_tap_state end_state;
 	struct tms_command tms;
 	struct jtag_xfer xfer;
 	uint32_t data_buf;
@@ -336,56 +347,19 @@ static int jtag_driver_reset(int trst, int srst)
 	LOG_DEBUG_IO("JTAG DRIVER DEBUG: reset trst: %i srst %i", trst, srst);
 
 	if (trst == 1) {
-		if (jtag_hw_accel == 0) {
-			/* SW (bitbang) mode */
-			/* Perform ioctl() JTAG_SIOCSTATE call to reset JTAG */
-			/* controller state to Test-Logic-Reset (TLR) */
-			end_state.reset = JTAG_FORCE_RESET;
-			end_state.endstate = JTAG_STATE_TLRESET;
-			end_state.tck = 0;
-			ret_errno = ioctl(jtag_fd, JTAG_SIOCSTATE, &end_state);
-			if (ret_errno < 0) {
-				LOG_ERROR("JTAG DRIVER ERROR: couldn't reset JTAG state machine");
-				ret = ERROR_FAIL;
-			} else {
-				LOG_INFO("JTAG DRIVER INFO: SW - Successfully reset JTAG state machine");
-				tap_set_state(TAP_RESET);
-			}
+		/* Perform ioctl() JTAG_SIOCSTATE call to reset JTAG */
+		/* controller state to Test-Logic-Reset (TLR) */
+		end_state.from = JTAG_STATE_CURRENT;
+		end_state.reset = JTAG_FORCE_RESET;
+		end_state.endstate = JTAG_STATE_TLRESET;
+		end_state.tck = 0;
+		ret_errno = ioctl(jtag_fd, JTAG_SIOCSTATE, &end_state);
+		if (ret_errno < 0) {
+			LOG_ERROR("JTAG DRIVER ERROR: couldn't reset JTAG state machine");
+			ret = ERROR_FAIL;
 		} else {
-			/* HW acceleration mode enabled */
-
-			/* There are two issues with initializing the controller for HW mode. */
-			/* 1. Resetting the JTAG state machine to Test-Logic-Reset (TLR) */
-			/*    doesn't work with the ioctl() JTAG_SIOCSTATE call as it */
-			/*    does with (bitbang) mode. The workaround is to force */
-			/*    a reset by holding TMS high and pulsing TCK five times. */
-			/* 2. After switching to HW mode and resetting the JTAG state */
-			/*    machine to TLR, for Coresight topology, the first */
-			/*    DP CTRL/STAT read returns incorrect data. The workaround */
-			/*    is after switching to HW mode and resetting to TLR state, */
-			/*    perform a dummy DR read (not write) and discard the result. */
-			bits = 0x1F;
-			tms.num_bits = 5;
-			tms.bits = &bits;
-			ret = jtag_driver_execute_tms(&tms);
-			if (ret != ERROR_OK)
-				LOG_ERROR("JTAG DRIVER ERROR: couldn't reset JTAG state machine");
-			else {
-				LOG_INFO("JTAG DRIVER INFO: HW - Successfully reset JTAG state machine");
-				/* Bug Workaround - perform the dummy DR read */
-				xfer.type = JTAG_SDR_XFER;       /* Type is DR scan */
-				xfer.direction = JTAG_READ_XFER; /* Only perform DR read, no write */
-				xfer.length = (__u32)1;          /* Only a single bit is needed */
-				xfer.tdio = (__u64)(uintptr_t)(&data_buf);  /* Location to store read result */
-				xfer.endstate = JTAG_STATE_TLRESET;
-
-				ret_errno = ioctl(jtag_fd, JTAG_IOCXFER, &xfer);
-				if (ret_errno < 0) {
-					LOG_ERROR("JTAG DRIVER ERROR: scan failed");
-					ret = ERROR_FAIL;
-				} else
-					tap_set_state(TAP_RESET);
-			}
+			LOG_INFO("JTAG DRIVER INFO: Successfully reset JTAG state machine");
+			tap_set_state(TAP_RESET);
 		}
 	}
 
@@ -412,6 +386,7 @@ static int jtag_driver_execute_sleep(struct sleep_command *sleep)
 
 static int jtag_driver_execute_tms(struct tms_command *tms)
 {
+	struct bitbang_packet bitbang_packet;
 	struct tck_bitbang bitbang;
 	int ret = ERROR_OK;
 	int ret_errno;
@@ -424,6 +399,9 @@ static int jtag_driver_execute_tms(struct tms_command *tms)
 	bitbang.tdi = (__u8)0;
 	bitbang.tdo = (__u8)0;
 
+	bitbang_packet.data = &bitbang;
+	bitbang_packet.length = 1;
+
 	index = 0;
 	j = 0;
 
@@ -431,7 +409,7 @@ static int jtag_driver_execute_tms(struct tms_command *tms)
 		this_len = tms_num_bits > 8 ? 8 : tms_num_bits;
 		for (i = 0; i < this_len && ret == ERROR_OK; i++) {
 			bitbang.tms = (__u8)((tms_bits >> i) & 0x1);
-			ret_errno = ioctl(jtag_fd, JTAG_IOCBITBANG, &bitbang);
+			ret_errno = ioctl(jtag_fd, JTAG_IOCBITBANG, &bitbang_packet);
 			if (ret_errno < 0) {
 				LOG_ERROR("JTAG DRIVER ERROR: execute_tms failed");
 				ret = ERROR_FAIL;
@@ -508,7 +486,7 @@ static int jtag_driver_init(void)
 	LOG_INFO("JTAG DRIVER INFO: Connection to /dev/jtag%u succeeded", jtag_instance);
 
 	jmode.feature = JTAG_CONTROL_MODE;
-	jmode.mode = JTAG_MASTER_MODE;   /* JTAG_MASTER_MODE or JTAG_SLAVE_MODE */
+	jmode.mode = JTAG_MASTER_MODE;   /* JTAG_MASTER_MODE or JTAG_MASTER_OUTPUT_DISABLE */
 	ret_errno = ioctl(jtag_fd, JTAG_SIOCMODE, &jmode);
 	if (ret_errno < 0) {
 		LOG_ERROR("JTAG DRIVER ERROR: unable to set JTAG_CONTROL_MODE");
